@@ -1,9 +1,9 @@
-// pi-llamafile/src/extension.ts
+// pi-embedded-ai/src/extension.ts
 //
-// Local llamafile manager for pi. Discovers `.llamafile` executables on the host,
+// Local AI manager for pi (llamafile-based). Discovers `.llamafile` executables on the host,
 // serves them as local OpenAI-compatible providers, and registers the selected one
 // as the out-of-the-box local model. No bundled weights: models ship separately
-// (see the pi-llamafile-models distro) and are discovered at runtime.
+// Weights ship separately (see the awesome-llamafiles distro) and are discovered at runtime.
 //
 // Runs on QuickJS as well as Node: only `node:child_process` (spawn), `node:fs`,
 // `node:os`, `node:path` and global `fetch` are used.
@@ -13,7 +13,9 @@ import { existsSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSy
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
-const PROVIDER_ID = "llamafile";
+const PROVIDER_ID = "embedded-ai";
+const LEGACY_PROVIDER_ID = "llamafile";
+const MANAGER_ID = "pi-embedded-ai";
 const DEFAULT_PORT = 8080;
 const DEFAULT_CTX_SIZE = 131072;
 const HEALTH_TIMEOUT_MS = 180000;
@@ -35,7 +37,7 @@ interface ServerState {
 let active: ServerState | null = null;
 
 function log(message: string) {
-  console.error(`[pi-llamafile] ${message}`);
+  console.error(`[pi-embedded-ai] ${message}`);
 }
 
 /** Candidate roots, in priority order. */
@@ -132,7 +134,7 @@ async function waitForHealth(baseUrl: string, onProgress: (message: string) => v
 }
 
 function pidFile(modelId: string): string {
-  return join(tmpdir(), `pi-llamafile-${modelId}.pid`);
+  return join(tmpdir(), `pi-embedded-ai-${modelId}.pid`);
 }
 
 function readPid(modelId: string): number | null {
@@ -226,10 +228,21 @@ function readModelsFile(): any {
   }
 }
 
+function normalizeModels(models: any[]): any[] {
+  return (models ?? []).map((model) => ({ ...model, provider: PROVIDER_ID }));
+}
+
 function managedEntry(): any | null {
   const file = readModelsFile();
   const entry = file?.providers?.[PROVIDER_ID];
-  if (entry && (entry.managedBy === "pi-llamafile" || entry.managedBy === undefined)) return entry;
+  if (entry && (entry.managedBy === MANAGER_ID || entry.managedBy === undefined)) {
+    return { ...entry, models: normalizeModels(entry.models) };
+  }
+  // Migrate a provider persisted by pi-llamafile (pre-rename): same shape, new key.
+  const legacy = file?.providers?.[LEGACY_PROVIDER_ID];
+  if (legacy && (legacy.managedBy === "pi-llamafile" || legacy.managedBy === undefined)) {
+    return { ...legacy, models: normalizeModels(legacy.models) };
+  }
   return null;
 }
 
@@ -237,17 +250,18 @@ function writeManagedProvider(models: any[]): void {
   const file = readModelsFile();
   file.providers = file.providers ?? {};
   const existing = file.providers[PROVIDER_ID];
-  if (existing && existing.managedBy !== "pi-llamafile" && existing.managedBy !== undefined) {
-    log("models.json has a user-managed llamafile provider; leaving it alone");
+  if (existing && existing.managedBy !== MANAGER_ID && existing.managedBy !== undefined) {
+    log("models.json has a user-managed embedded-ai provider; leaving it alone");
     return;
   }
+  delete file.providers[LEGACY_PROVIDER_ID];
   file.providers[PROVIDER_ID] = {
-    name: "llamafile (local)",
+    name: "embedded AI (local)",
     baseUrl: `http://127.0.0.1:${port()}/v1`,
     apiKey: "local",
     api: "openai-completions",
     models,
-    managedBy: "pi-llamafile",
+    managedBy: MANAGER_ID,
   };
   writeFileSync(agentModelsPath(), JSON.stringify(file, null, 2) + "\n");
 }
@@ -280,7 +294,7 @@ async function fetchModels(baseUrl: string): Promise<any[]> {
 function providerConfig(baseUrl: string, models: any[]) {
   return {
     id: PROVIDER_ID,
-    name: "llamafile (local)",
+    name: "embedded AI (local)",
     apiKey: "local",
     baseUrl: `${baseUrl}/v1`,
     models,
@@ -290,8 +304,8 @@ function providerConfig(baseUrl: string, models: any[]) {
 
 export default function piLlamafileExtension(pi: ExtensionAPI) {
   const packageDir = dirname(new URL(import.meta.url).pathname);
-  pi.registerCommand("llamafile", {
-    description: "Manage local llamafile models: list, start, stop, status",
+  pi.registerCommand("embedded-ai", {
+    description: "Manage local AI models (llamafile): list, start, stop, status",
     handler: async (args: string[]) => {
       const [sub, ...rest] = args;
       const models = discoverModels(packageDir);
@@ -317,12 +331,12 @@ export default function piLlamafileExtension(pi: ExtensionAPI) {
         pi.unregisterProvider(PROVIDER_ID);
         return "llamafile server stopped";
       }
-      return "usage: /llamafile [list|start [name]|stop|status]";
+      return "usage: /embedded-ai [list|start [name]|stop|status]";
     },
   });
 
   // Auto-start the first discovered model and register it as the local provider.
-  // A missing model is not fatal: the extension loads, start is manual via /llamafile.
+  // A missing model is not fatal: the extension loads, start is manual via /embedded-ai.
   // A previously persisted provider registers synchronously so the first model
   // resolution already sees it; the running server is ensured in the background.
   const persisted = managedEntry();
@@ -339,6 +353,6 @@ export default function piLlamafileExtension(pi: ExtensionAPI) {
       })
       .catch((error: unknown) => log(`auto-start skipped: ${error instanceof Error ? error.message : String(error)}`));
   } else {
-    log("no .llamafile discovered; use /llamafile list after placing one in ~/.pi/agent/models or ~/models");
+    log("no .llamafile discovered; use /embedded-ai list after placing one in ~/.pi/agent/models or ~/models");
   }
 }

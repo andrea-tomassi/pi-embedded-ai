@@ -1,11 +1,11 @@
-# pi-llamafile
+# pi-embedded-ai
 
-Local llamafile model manager for [pi](https://github.com/earendil-works/pi)
+Local AI manager (llamafile-based) for [pi](https://github.com/earendil-works/pi)
 (and the pi-rust port). Discovers `.llamafile` executables on the host, serves
-them as local OpenAI-compatible providers, and registers the selected one as
+them as a local OpenAI-compatible provider, and registers the selected one as
 the out-of-the-box local model.
 
-**No weights are bundled.** Models ship separately (see `pi-llamafile-models`)
+**No weights are bundled.** Models ship separately (see [awesome-llamafiles](https://github.com/andrea-tomassi/awesome-llamafiles))
 and are discovered at runtime. This package is MIT.
 
 ## Install
@@ -13,7 +13,7 @@ and are discovered at runtime. This package is MIT.
 From a local checkout (works fully offline):
 
 ```sh
-pi install ./pi-llamafile/
+pi install ./pi-embedded-ai/
 ```
 
 ## How it works
@@ -27,17 +27,17 @@ On load the extension scans, in order:
 
 The first valid `.llamafile` is started (`--server --host 127.0.0.1
 --port $PI_LLAMAFILE_PORT --ctx-size $PI_LLAMAFILE_CTX`, defaults 8080 and
-128k) and registered as the `llamafile` provider. A port held by anything else
+128k) and registered as the `embedded-ai` provider. A port held by anything else
 is reported, never reused or killed. Crash leftovers are adopted through a PID
 file; stopping the extension (or the host) terminates the server.
 
 ## Commands
 
 ```
-/llamafile list          discovered models
-/llamafile start [name]  serve a model (default: first discovered)
-/llamafile stop          terminate the managed server
-/llamafile status        health of the managed server
+/embedded-ai list          discovered models
+/embedded-ai start [name]  serve a model (default: first discovered)
+/embedded-ai stop          terminate the managed server
+/embedded-ai status        health of the managed server
 ```
 
 ## Settings

@@ -1,5 +1,5 @@
 {
-  "name": "pi-llamafile",
+  "name": "pi-embedded-ai",
   "version": "0.1.0",
   "description": "Local llamafile model manager for pi: discovers .llamafile servers, starts/stops them, and registers them as the default local provider",
   "license": "MIT",
