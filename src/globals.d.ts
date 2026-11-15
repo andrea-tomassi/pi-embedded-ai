@@ -6,8 +6,10 @@ declare module "node:child_process" {
 declare module "node:fs" {
   export function existsSync(p: string): boolean;
   export function readdirSync(p: string): string[];
+  export function readlinkSync(p: string): string;
+  export function unlinkSync(p: string): void;
   export function readFileSync(p: string, enc?: string): string;
-  export function writeFileSync(p: string, data: string): void;
+  export function writeFileSync(p: string, data: string, options?: any): void;
   export function mkdirSync(p: string, opts?: any): void;
   export function statSync(p: string): { isDirectory(): boolean; isFile(): boolean };
 }

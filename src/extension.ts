@@ -9,7 +9,7 @@
 // `node:os`, `node:path` and global `fetch` are used.
 
 import { spawn } from "node:child_process";
-import { existsSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -228,10 +228,117 @@ function processMatchesCmdline(pid: number, expectedPath: string): boolean {
 
 function clearPid(modelId: string): void {
   try {
-    writeFileSync(pidFile(modelId), "");
+    unlinkSync(pidFile(modelId));
   } catch {
-    // Best effort.
+    // Already gone.
   }
+}
+
+/**
+ * The PID of the process listening on `port`, resolved from `/proc` (Linux). A llamafile run
+ * through `sh` re-execs itself through the APE loader, so the spawned PID is not always the
+ * socket owner: the PID file must record this one for `stop` to reach the real server.
+ */
+function resolveListenerPid(port: number): number | null {
+  const hexPort = port.toString(16).toUpperCase().padStart(4, "0");
+  let inode: string | null = null;
+  for (const file of ["/proc/net/tcp", "/proc/net/tcp6"]) {
+    let text: string;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      continue;
+    }
+    for (const line of text.split("\n").slice(1)) {
+      const fields = line.trim().split(/\s+/);
+      if (fields.length < 10) continue;
+      const local = fields[1] ?? "";
+      if (!local.endsWith(`:${hexPort}`)) continue;
+      if (fields[3] !== "0A") continue; // 0A == LISTEN
+      inode = fields[9] ?? null;
+      break;
+    }
+    if (inode) break;
+  }
+  if (!inode) return null;
+  let pids: string[];
+  try {
+    pids = readdirSync("/proc");
+  } catch {
+    return null;
+  }
+  for (const pid of pids) {
+    if (!/^\d+$/.test(pid)) continue;
+    let fds: string[];
+    try {
+      fds = readdirSync(`/proc/${pid}/fd`);
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      try {
+        if (readlinkSync(`/proc/${pid}/fd/${fd}`) === `socket:[${inode}]`) return Number(pid);
+      } catch {
+        // fd closed while scanning.
+      }
+    }
+  }
+  return null;
+}
+
+/** Exclusive cross-process claim on (model, port), so two sessions cannot both spawn. */
+function lockFile(modelId: string, port: number): string {
+  return join(tmpdir(), `pi-embedded-ai-${modelId}-${port}.lock`);
+}
+
+function tryLock(modelId: string, port: number): boolean {
+  try {
+    writeFileSync(lockFile(modelId, port), String(process.pid), { flag: "wx" });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseLock(modelId: string, port: number): void {
+  try {
+    unlinkSync(lockFile(modelId, port));
+  } catch {
+    // Already gone.
+  }
+}
+
+function signalPid(pid: number, signal: string): void {
+  try {
+    process.kill(pid, signal);
+  } catch {
+    // Already gone.
+  }
+}
+
+/**
+ * Terminate the server of `model`, whether or not this session started it: the PID file and the
+ * listening socket are the sources of truth, because another tab may own the running process.
+ */
+export async function stopModel(model: ManagedModel, port = settings().port): Promise<number | null> {
+  const candidates = new Set<number>();
+  const recorded = readPid(model.id);
+  if (recorded !== null && processMatchesCmdline(recorded, model.path)) candidates.add(recorded);
+  const listener = resolveListenerPid(port);
+  if (listener !== null && processMatchesCmdline(listener, model.path)) candidates.add(listener);
+
+  for (const pid of candidates) signalPid(pid, "SIGTERM");
+  if (candidates.size > 0) await waitForDown(`http://127.0.0.1:${port}`);
+  // Backstop: anything still holding the port for this model gets SIGKILL.
+  const stubborn = resolveListenerPid(port);
+  if (stubborn !== null && processMatchesCmdline(stubborn, model.path)) {
+    signalPid(stubborn, "SIGKILL");
+    candidates.add(stubborn);
+    await waitForDown(`http://127.0.0.1:${port}`);
+  }
+  clearPid(model.id);
+  releaseLock(model.id, port);
+  return candidates.size > 0 ? [...candidates][0]! : null;
 }
 
 export async function startServer(
@@ -261,22 +368,59 @@ export async function startServer(
     active = { pid: leftover, port: serverPort, modelId: model.id, path: model.path };
     return baseUrl;
   }
+  // Another session may be loading this model right now: wait for it instead of spawning a
+  // second server that would lose the port and then record its own dead PID.
+  if (!tryLock(model.id, serverPort)) {
+    onProgress(`another session is starting ${model.id}; waiting for ${baseUrl}`);
+    await waitForHealth(baseUrl, onProgress);
+    const pid = resolveListenerPid(serverPort);
+    if (pid !== null && !processMatchesCmdline(pid, model.path)) {
+      throw new Error(`port ${serverPort} is served by a process that is not ${model.id}`);
+    }
+    const adopted = pid ?? readPid(model.id);
+    if (adopted !== null) {
+      try {
+        writeFileSync(pidFile(model.id), String(adopted));
+      } catch {
+        // Non-fatal.
+      }
+    }
+    active = { pid: adopted, port: serverPort, modelId: model.id, path: model.path };
+    return baseUrl;
+  }
+
   onProgress(`starting ${model.id} on ${baseUrl} (ctx ${ctx})`);
   const child = spawn(
     "sh",
     [model.path, "--server", "--host", "127.0.0.1", "--port", String(serverPort), "--ctx-size", String(ctx)],
     { stdio: ["ignore", "pipe", "pipe"], detached: true },
   );
-  if (child.pid === undefined) throw new Error("could not start the llamafile server");
+  if (child.pid === undefined) {
+    releaseLock(model.id, serverPort);
+    throw new Error("could not start the llamafile server");
+  }
   attachLogTap(model.id, child);
+  (child as any).unref?.();
   try {
-    writeFileSync(pidFile(model.id), String(child.pid));
+    await waitForHealth(baseUrl, onProgress);
+  } catch (error) {
+    releaseLock(model.id, serverPort);
+    throw error;
+  }
+  // The socket owner is the real server; `sh` may have re-execed through the APE loader.
+  const owner = resolveListenerPid(serverPort) ?? child.pid;
+  if (owner !== child.pid && !processMatchesCmdline(owner, model.path)) {
+    signalPid(child.pid, "SIGTERM");
+    releaseLock(model.id, serverPort);
+    throw new Error(`port ${serverPort} is served by a process that is not ${model.id}`);
+  }
+  try {
+    writeFileSync(pidFile(model.id), String(owner));
   } catch {
     // Non-fatal: without a PID file a crash leftover just won't be adopted.
   }
-  (child as any).unref?.();
-  await waitForHealth(baseUrl, onProgress);
-  active = { pid: child.pid, port: serverPort, modelId: model.id, path: model.path };
+  releaseLock(model.id, serverPort);
+  active = { pid: owner, port: serverPort, modelId: model.id, path: model.path };
   return baseUrl;
 }
 
@@ -349,19 +493,21 @@ async function waitForDown(baseUrl: string, timeoutMs = 20000): Promise<void> {
   throw new Error(`the llamafile server on ${baseUrl} did not stop within ${timeoutMs / 1000}s`);
 }
 
-export async function stopServer(): Promise<void> {
-  if (!active) return;
-  const { pid, modelId, port } = active;
+export async function stopServer(): Promise<number | null> {
+  const current = active;
+  const modelId = current?.modelId ?? settings().modelId ?? discoverModels()[0]?.id;
+  const port = current?.port ?? settings().port;
   active = null;
-  flushLog(modelId);
-  if (pid === null) return;
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
-    // Already gone: nothing to do.
+  if (modelId) flushLog(modelId);
+  const model = discoverModels().find((candidate) => candidate.id === modelId);
+  if (!model) {
+    if (!current || current.pid === null) return null;
+    signalPid(current.pid, "SIGTERM");
+    clearPid(modelId ?? "");
+    await waitForDown(`http://127.0.0.1:${current.port}`);
+    return current.pid;
   }
-  clearPid(modelId);
-  await waitForDown(`http://127.0.0.1:${port}`);
+  return stopModel(model, port);
 }
 
 /** Probe every discovered model: running (healthy), loading (PID but unhealthy), or stopped. */
@@ -439,6 +585,11 @@ function writeManagedProvider(models: any[]): void {
     models,
     managedBy: MANAGER_ID,
   };
+  try {
+    mkdirSync(dirname(agentModelsPath()), { recursive: true });
+  } catch {
+    // Directory already there.
+  }
   writeFileSync(agentModelsPath(), JSON.stringify(file, null, 2) + "\n");
 }
 
