@@ -1,7 +1,7 @@
 {
   "name": "pi-embedded-ai",
-  "version": "0.1.0",
-  "description": "Local llamafile model manager for pi: discovers .llamafile servers, starts/stops them, and registers them as the default local provider",
+  "version": "0.1.1",
+  "description": "Local AI manager (llamafile-based) for pi: discovers models, runs their servers, registers them as a local provider",
   "license": "MIT",
   "type": "module",
   "exports": {
