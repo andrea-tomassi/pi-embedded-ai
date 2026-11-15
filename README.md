@@ -33,6 +33,9 @@ file; stopping the extension (or the host) terminates the server.
 
 ## Commands
 
+Type `/embedded-ai` with no argument to see the status and the usage recap;
+each subcommand reports its result as a notification.
+
 ```
 /embedded-ai list          discovered models ([preferred], [active])
 /embedded-ai status        servers: running, loading or stopped (all discovered models)

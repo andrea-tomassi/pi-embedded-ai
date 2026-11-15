@@ -510,86 +510,134 @@ export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
   packageDir = dirname(new URL(import.meta.url).pathname);
   pi.registerCommand("embedded-ai", {
     description: "Manage local AI models: list, start, use, stop, ctx, port, status, logs",
-    handler: async (args: string[]) => {
-      const [sub, ...rest] = args;
-      const models = discoverModels();
-      if (sub === "list" || !sub) {
-        if (models.length === 0) return "no .llamafile found (PI_LLAMAFILE_DIR, ~/.pi/agent/models, ~/models)";
-        const preferred = settings().modelId;
-        return models
-          .map((model) => `${model.id}${model.id === preferred ? " [preferred]" : ""}${active?.modelId === model.id ? " [active]" : ""}\n  ${model.path}`)
-          .join("\n");
-      }
-      if (sub === "status") return serverStatus();
-      if (sub === "logs") {
-        const n = parseInt(rest[0] ?? "30", 10);
-        const target = active?.modelId ?? settings().modelId ?? models[0]?.id;
-        if (!target) return "no model selected yet";
-        try {
-          const content = readFileSync(logFile(target), "utf8").trim().split("\n");
-          return content.slice(-(Number.isInteger(n) && n > 0 ? n : 30)).join("\n") || "(empty log)";
-        } catch {
-          return `(no log file for ${target} yet)`;
+    // The host passes the raw argument string plus a command context; output goes to ui.notify.
+    handler: async (rawArgs: string, ctx: any) => {
+      const argv = String(rawArgs ?? "").trim().split(/\s+/).filter(Boolean);
+      const [sub, ...rest] = argv;
+      const say = (text: string) => ctx?.ui?.notify?.(text, "info");
+      const fail = (text: string) => ctx?.ui?.notify?.(text, "error");
+      try {
+        const models = discoverModels();
+        if (!sub) {
+          const status = await serverStatus();
+          say(`${status}\n\n${USAGE}`);
+          return;
         }
-      }
-      if (sub === "start") {
-        const wanted = rest[0];
-        const preferred = settings().modelId;
-        const model =
-          (wanted && models.find((candidate) => candidate.id === wanted)) ??
-          models.find((candidate) => candidate.id === preferred) ??
-          models[0];
-        if (!model) return wanted ? `no llamafile named ${wanted}` : "no .llamafile found";
-        if (active && active.modelId === model.id && (await healthy(`http://127.0.0.1:${active.port}`))) {
-          return `${model.id} already running`;
+        if (sub === "list") {
+          if (models.length === 0) {
+            fail("no .llamafile found (PI_LLAMAFILE_DIR, ~/.pi/agent/models, ~/models)");
+            return;
+          }
+          const preferred = settings().modelId;
+          say(
+            models
+              .map(
+                (model) =>
+                  `${model.id}${model.id === preferred ? " [preferred]" : ""}${active?.modelId === model.id ? " [active]" : ""}\n  ${model.path}`,
+              )
+              .join("\n"),
+          );
+          return;
         }
-        return serialize(async () => {
-          const baseUrl = await startServer(model);
-          return registerRunning(model, baseUrl);
-        });
-      }
-      if (sub === "use") {
-        const wanted = rest[0];
-        if (!wanted) return "usage: /embedded-ai use <name>";
-        const model = models.find((candidate) => candidate.id === wanted);
-        if (!model) return `no llamafile named ${wanted}`;
-        return switchTo(model);
-      }
-      if (sub === "stop") {
-        const was = active?.modelId;
-        await serialize(async () => stopServer());
-        api?.unregisterProvider(PROVIDER_ID);
-        return was ? `${was} stopped` : "no managed server was running";
-      }
-      if (sub === "ctx" || sub === "port") {
-        const value = parseInt(rest[0] ?? "", 10);
-        if (sub === "ctx" && (!Number.isInteger(value) || value < 1024)) return "usage: /embedded-ai ctx <n>  (n >= 1024)";
-        if (sub === "port" && (!Number.isInteger(value) || value < 1 || value > 65535)) {
-          return "usage: /embedded-ai port <n>  (1-65535)";
+        if (sub === "status") {
+          say(await serverStatus());
+          return;
         }
-        const patch = sub === "ctx" ? { ctxSize: value } : { port: value };
-        const next = saveSettings(patch);
-        const overridden =
-          (sub === "ctx" && process.env["PI_LLAMAFILE_CTX"] !== undefined) ||
-          (sub === "port" && process.env["PI_LLAMAFILE_PORT"] !== undefined)
-            ? " (note: the PI_LLAMAFILE_* env var takes precedence over the saved setting)"
-            : "";
-        // Restart the running server (or the preferred model) with the new setting.
-        const current =
-          (active && models.find((candidate) => candidate.id === active?.modelId)) ??
-          models.find((candidate) => candidate.id === next.modelId) ??
-          models[0];
-        if (!current) return "no .llamafile found";
-        return await serialize(async () => {
-          await stopServer();
-          // A port change moves the provider URL: drop the stale registration first.
-          if (sub === "port") api?.unregisterProvider(PROVIDER_ID);
-          const baseUrl = await startServer(current, sub === "port" ? { port: next.port } : { ctxSize: next.ctxSize });
-          const done = await registerRunning(current, baseUrl);
-          return done + overridden;
-        });
+        if (sub === "logs") {
+          const n = parseInt(rest[0] ?? "30", 10);
+          const target = active?.modelId ?? settings().modelId ?? models[0]?.id;
+          if (!target) {
+            fail("no model selected yet");
+            return;
+          }
+          try {
+            const content = readFileSync(logFile(target), "utf8").trim().split("\n");
+            say(`log ${target} (last ${n}):\n${content.slice(-(Number.isInteger(n) && n > 0 ? n : 30)).join("\n")}`);
+          } catch {
+            fail(`(no log file for ${target} yet)`);
+          }
+          return;
+        }
+        if (sub === "start") {
+          const wanted = rest[0];
+          const preferred = settings().modelId;
+          const model =
+            (wanted && models.find((candidate) => candidate.id === wanted)) ??
+            models.find((candidate) => candidate.id === preferred) ??
+            models[0];
+          if (!model) {
+            fail(wanted ? `no llamafile named ${wanted}` : "no .llamafile found");
+            return;
+          }
+          if (active && active.modelId === model.id && (await healthy(`http://127.0.0.1:${active.port}`))) {
+            say(`${model.id} already running`);
+            return;
+          }
+          say("starting...");
+          say(await serialize(async () => registerRunning(model, await startServer(model))));
+          return;
+        }
+        if (sub === "use") {
+          const wanted = rest[0];
+          if (!wanted) {
+            fail("usage: /embedded-ai use <name>");
+            return;
+          }
+          const model = models.find((candidate) => candidate.id === wanted);
+          if (!model) {
+            fail(`no llamafile named ${wanted}`);
+            return;
+          }
+          say(`switching to ${model.id}...`);
+          say(await switchTo(model));
+          return;
+        }
+        if (sub === "stop") {
+          const was = active?.modelId;
+          await serialize(async () => stopServer());
+          api?.unregisterProvider(PROVIDER_ID);
+          say(was ? `${was} stopped` : "no managed server was running");
+          return;
+        }
+        if (sub === "ctx" || sub === "port") {
+          const value = parseInt(rest[0] ?? "", 10);
+          if (sub === "ctx" && (!Number.isInteger(value) || value < 1024)) {
+            fail("usage: /embedded-ai ctx <n>  (n >= 1024)");
+            return;
+          }
+          if (sub === "port" && (!Number.isInteger(value) || value < 1 || value > 65535)) {
+            fail("usage: /embedded-ai port <n>  (1-65535)");
+            return;
+          }
+          const patch = sub === "ctx" ? { ctxSize: value } : { port: value };
+          const next = saveSettings(patch);
+          const overridden =
+            (sub === "ctx" && process.env["PI_LLAMAFILE_CTX"] !== undefined) ||
+            (sub === "port" && process.env["PI_LLAMAFILE_PORT"] !== undefined)
+              ? " (note: the PI_LLAMAFILE_* env var takes precedence over the saved setting)"
+              : "";
+          const current =
+            (active && models.find((candidate) => candidate.id === active?.modelId)) ??
+            models.find((candidate) => candidate.id === next.modelId) ??
+            models[0];
+          if (!current) {
+            fail("no .llamafile found");
+            return;
+          }
+          say(`${sub === "ctx" ? "restarting with ctx " + next.ctxSize : "restarting on port " + next.port}...`);
+          const done = await serialize(async () => {
+            await stopServer();
+            if (sub === "port") api?.unregisterProvider(PROVIDER_ID);
+            const baseUrl = await startServer(current, sub === "port" ? { port: next.port } : { ctxSize: next.ctxSize });
+            return registerRunning(current, baseUrl);
+          });
+          say(done + overridden);
+          return;
+        }
+        fail(USAGE);
+      } catch (error) {
+        fail(error instanceof Error ? error.message : String(error));
       }
-      return USAGE;
     },
   });
 
