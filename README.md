@@ -35,7 +35,7 @@ file; stopping the extension (or the host) terminates the server.
 
 ```
 /embedded-ai list          discovered models ([preferred], [active])
-/embedded-ai status       servers: running, loading or stopped
+/embedded-ai status        servers: running, loading or stopped (all discovered models)
 /embedded-ai start [name] serve a model (default: preferred or first discovered)
 /embedded-ai use <name>    switch to a model (restarts the server, remembers the choice)
 /embedded-ai stop          terminate the managed server
@@ -46,7 +46,7 @@ file; stopping the extension (or the host) terminates the server.
 
 Settings persist in `~/.pi/agent/llamafile.json` (`port`, `ctxSize`,
 `modelId`); `PI_LLAMAFILE_PORT`, `PI_LLAMAFILE_CTX`, `PI_LLAMAFILE_MODEL`
-env vars override them.
+env vars override them (the commands say so when this happens).
 
 ## Settings
 

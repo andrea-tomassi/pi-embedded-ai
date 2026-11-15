@@ -44,6 +44,14 @@ let active: ServerState | null = null;
 let packageDir = "";
 let api: ExtensionAPI | null = null;
 
+/** Serialize lifecycle operations: auto-start and commands never race each other. */
+let busy: Promise<unknown> = Promise.resolve();
+function serialize<T>(fn: () => Promise<T>): Promise<T> {
+  const run = busy.then(fn, fn);
+  busy = run.catch(() => {});
+  return run;
+}
+
 function log(message: string) {
   console.error(`[pi-embedded-ai] ${message}`);
 }
@@ -479,10 +487,12 @@ async function registerRunning(model: ManagedModel, baseUrl: string): Promise<st
 }
 
 async function switchTo(model: ManagedModel): Promise<string> {
-  if (active && active.modelId !== model.id) await stopServer();
-  saveSettings({ modelId: model.id });
-  const baseUrl = await startServer(model);
-  return registerRunning(model, baseUrl);
+  return serialize(async () => {
+    if (active && active.modelId !== model.id) await stopServer();
+    saveSettings({ modelId: model.id });
+    const baseUrl = await startServer(model);
+    return registerRunning(model, baseUrl);
+  });
 }
 
 const USAGE = `usage: /embedded-ai [list|status|start [name]|use <name>|stop|ctx <n>|port <n>|logs [n]]
@@ -533,8 +543,10 @@ export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
         if (active && active.modelId === model.id && (await healthy(`http://127.0.0.1:${active.port}`))) {
           return `${model.id} already running`;
         }
-        const baseUrl = await startServer(model);
-        return registerRunning(model, baseUrl);
+        return serialize(async () => {
+          const baseUrl = await startServer(model);
+          return registerRunning(model, baseUrl);
+        });
       }
       if (sub === "use") {
         const wanted = rest[0];
@@ -545,7 +557,7 @@ export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
       }
       if (sub === "stop") {
         const was = active?.modelId;
-        await stopServer();
+        await serialize(async () => stopServer());
         api?.unregisterProvider(PROVIDER_ID);
         return was ? `${was} stopped` : "no managed server was running";
       }
@@ -557,17 +569,25 @@ export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
         }
         const patch = sub === "ctx" ? { ctxSize: value } : { port: value };
         const next = saveSettings(patch);
+        const overridden =
+          (sub === "ctx" && process.env["PI_LLAMAFILE_CTX"] !== undefined) ||
+          (sub === "port" && process.env["PI_LLAMAFILE_PORT"] !== undefined)
+            ? " (note: the PI_LLAMAFILE_* env var takes precedence over the saved setting)"
+            : "";
         // Restart the running server (or the preferred model) with the new setting.
         const current =
           (active && models.find((candidate) => candidate.id === active?.modelId)) ??
           models.find((candidate) => candidate.id === next.modelId) ??
           models[0];
         if (!current) return "no .llamafile found";
-        await stopServer();
-        // A port change moves the provider URL: drop the stale registration first.
-        if (sub === "port") api?.unregisterProvider(PROVIDER_ID);
-        const baseUrl = await startServer(current, sub === "port" ? { port: next.port } : { ctxSize: next.ctxSize });
-        return registerRunning(current, baseUrl);
+        return await serialize(async () => {
+          await stopServer();
+          // A port change moves the provider URL: drop the stale registration first.
+          if (sub === "port") api?.unregisterProvider(PROVIDER_ID);
+          const baseUrl = await startServer(current, sub === "port" ? { port: next.port } : { ctxSize: next.ctxSize });
+          const done = await registerRunning(current, baseUrl);
+          return done + overridden;
+        });
       }
       return USAGE;
     },
@@ -585,7 +605,7 @@ export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
   const preferred =
     discoverModels().find((candidate) => candidate.id === modelId) ?? discoverModels()[0];
   if (preferred) {
-    startServer(preferred)
+    serialize(() => startServer(preferred))
       .then(async (baseUrl) => {
         await registerRunning(preferred, baseUrl);
       })
