@@ -399,13 +399,16 @@ export async function startServer(
     releaseLock(model.id, serverPort);
     throw new Error("could not start the llamafile server");
   }
-  attachLogTap(model.id, child);
+  const detachLog = attachLogTap(model.id, child);
   (child as any).unref?.();
   try {
     await waitForHealth(baseUrl, onProgress);
   } catch (error) {
     releaseLock(model.id, serverPort);
     throw error;
+  } finally {
+    // Release the pipes even on failure: they must never outlive this call.
+    detachLog();
   }
   // The socket owner is the real server; `sh` may have re-execed through the APE loader.
   const owner = resolveListenerPid(serverPort) ?? child.pid;
@@ -431,7 +434,6 @@ export async function startServer(
 const LOG_LINES = 500;
 const logBuffers = new Map<string, string[]>();
 const logFlushed = new Map<string, number>();
-let logTimer: any = null;
 
 function appendLogLine(modelId: string, chunk: any): void {
   const text = typeof chunk === "string" ? chunk : String(chunk);
@@ -463,25 +465,43 @@ function flushLog(modelId: string): void {
   }
 }
 
-function attachLogTap(modelId: string, child: any): void {
+/**
+ * Mirror the server's stdout/stderr into its log file while it boots, then release both pipes.
+ *
+ * Holding these streams referenced keeps the hosting pi process alive: with the pipes attached a
+ * delegated subagent that spawned the server never exits after answering, and the caller waits
+ * forever. Startup output is what matters for diagnosis, so the tap is dropped once the server is
+ * healthy and the child handle (unref'd) is all that remains.
+ */
+function attachLogTap(modelId: string, child: any): () => void {
   logBuffers.set(modelId, []);
   logFlushed.set(modelId, 0);
+  const listeners: Array<{ stream: any; onData: (chunk: any) => void }> = [];
   const tap = (stream: any) => {
+    const onData = (chunk: any) => appendLogLine(modelId, chunk);
     try {
-      stream?.on?.("data", (chunk: any) => appendLogLine(modelId, chunk));
+      stream?.on?.("data", onData);
+      listeners.push({ stream, onData });
     } catch {
       // Streams without events: logging is best-effort.
     }
   };
   tap(child.stdout);
   tap(child.stderr);
-  const pump = () => {
-    flushLog(modelId);
-    if (active?.modelId === modelId) {
-      logTimer = setTimeout(pump, 2000);
+  const pump = setInterval(() => flushLog(modelId), 2000);
+  (pump as any).unref?.();
+  return () => {
+    clearInterval(pump);
+    for (const { stream, onData } of listeners) {
+      try {
+        stream?.off?.("data", onData);
+        stream?.destroy?.();
+      } catch {
+        // Already closed.
+      }
     }
+    flushLog(modelId);
   };
-  logTimer = setTimeout(pump, 2000);
 }
 
 async function waitForDown(baseUrl: string, timeoutMs = 20000): Promise<void> {
@@ -799,6 +819,13 @@ export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
   const persisted = managedEntry();
   if (persisted?.models?.length) {
     api?.registerProvider(PROVIDER_ID, providerConfig(`http://127.0.0.1:${settings().port}`, persisted.models));
+  }
+  // A delegated subagent shares the parent's model server: spawning one here would keep the
+  // child process alive besides being pointless. pi-open-agents marks depth in the environment.
+  const depth = Number(process.env["PI_OPEN_AGENTS_DEPTH"] ?? "0");
+  if (Number.isFinite(depth) && depth > 0) {
+    log("subagent process: model server managed by the parent session");
+    return;
   }
   const { modelId } = settings();
   const preferred =
