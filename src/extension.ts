@@ -1,8 +1,8 @@
 // pi-embedded-ai/src/extension.ts
 //
 // Local AI manager for pi (llamafile-based). Discovers `.llamafile` executables on the host,
-// serves them as local OpenAI-compatible providers, and registers the selected one
-// as the out-of-the-box local model. No bundled weights: models ship separately
+// serves the selected one as a local OpenAI-compatible provider, and registers it
+// as the out-of-the-box local model.
 // Weights ship separately (see the awesome-llamafiles distro) and are discovered at runtime.
 //
 // Runs on QuickJS as well as Node: only `node:child_process` (spawn), `node:fs`,
@@ -11,7 +11,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 
 const PROVIDER_ID = "embedded-ai";
 const LEGACY_PROVIDER_ID = "llamafile";
@@ -34,14 +34,22 @@ interface ServerState {
   path: string;
 }
 
+interface Settings {
+  port: number;
+  ctxSize: number;
+  modelId: string | null;
+}
+
 let active: ServerState | null = null;
+let packageDir = "";
+let api: ExtensionAPI | null = null;
 
 function log(message: string) {
   console.error(`[pi-embedded-ai] ${message}`);
 }
 
 /** Candidate roots, in priority order. */
-function searchRoots(packageDir: string): string[] {
+function searchRoots(): string[] {
   const home = homedir();
   const roots: string[] = [];
   const fromEnv = process.env["PI_LLAMAFILE_DIR"];
@@ -84,10 +92,10 @@ function scanDir(dir: string, depth: number): ManagedModel[] {
   return found;
 }
 
-export function discoverModels(packageDir: string): ManagedModel[] {
+export function discoverModels(): ManagedModel[] {
   const seen = new Set<string>();
   const models: ManagedModel[] = [];
-  for (const root of searchRoots(packageDir)) {
+  for (const root of searchRoots()) {
     for (const model of scanDir(root, 1)) {
       if (!seen.has(model.path)) {
         seen.add(model.path);
@@ -98,17 +106,67 @@ export function discoverModels(packageDir: string): ManagedModel[] {
   return models;
 }
 
-function port(): number {
-  const raw = process.env["PI_LLAMAFILE_PORT"];
-  const parsed = raw ? parseInt(raw, 10) : NaN;
-  return Number.isInteger(parsed) && parsed > 0 && parsed < 65536 ? parsed : DEFAULT_PORT;
+// ---------------------------------------------------------------------------
+// Settings: ~/.pi/agent/llamafile.json, overridden by PI_LLAMAFILE_* env.
+// ---------------------------------------------------------------------------
+
+function settingsPath(): string {
+  return join(homedir(), ".pi", "agent", "llamafile.json");
 }
 
-function ctxSize(): number {
-  const raw = process.env["PI_LLAMAFILE_CTX"];
-  const parsed = raw ? parseInt(raw, 10) : NaN;
-  return Number.isInteger(parsed) && parsed >= 1024 ? parsed : DEFAULT_CTX_SIZE;
+function readSettingsFile(): any {
+  try {
+    return JSON.parse(readFileSync(settingsPath(), "utf8"));
+  } catch {
+    return {};
+  }
 }
+
+function num(envValue: string | undefined, fallback: number, min: number, max = Number.MAX_SAFE_INTEGER): number {
+  const parsed = envValue ? parseInt(envValue, 10) : NaN;
+  if (Number.isInteger(parsed) && parsed >= min && parsed <= max) return parsed;
+  return fallback;
+}
+
+export function settings(): Settings {
+  const file = readSettingsFile();
+  const port = num(
+    process.env["PI_LLAMAFILE_PORT"],
+    num(String(file.port ?? ""), DEFAULT_PORT, 1, 65535),
+    1,
+    65535,
+  );
+  const ctxSize = num(
+    process.env["PI_LLAMAFILE_CTX"],
+    num(String(file.ctxSize ?? ""), DEFAULT_CTX_SIZE, 1024),
+    1024,
+  );
+  const modelId =
+    process.env["PI_LLAMAFILE_MODEL"] ??
+    (typeof file.modelId === "string" && file.modelId.length > 0 ? file.modelId : null);
+  return { port, ctxSize, modelId };
+}
+
+export function saveSettings(patch: Partial<Settings>): Settings {
+  const current = settings();
+  const next = { ...current, ...patch };
+  // Persist only what env does not override.
+  const file: any = {};
+  if (!process.env["PI_LLAMAFILE_PORT"]) file.port = next.port;
+  if (!process.env["PI_LLAMAFILE_CTX"]) file.ctxSize = next.ctxSize;
+  if (!process.env["PI_LLAMAFILE_MODEL"] && next.modelId) file.modelId = next.modelId;
+  try {
+    mkdirSync(dirname(settingsPath()), { recursive: true });
+    writeFileSync(settingsPath(), JSON.stringify(file, null, 2) + "\n");
+  } catch (error) {
+    log(`could not save settings: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// Server lifecycle.
+// ---------------------------------------------------------------------------
 
 async function healthy(baseUrl: string): Promise<boolean> {
   try {
@@ -137,6 +195,10 @@ function pidFile(modelId: string): string {
   return join(tmpdir(), `pi-embedded-ai-${modelId}.pid`);
 }
 
+function logFile(modelId: string): string {
+  return join(homedir(), ".pi", "agent", "models", `llamafile-${modelId}.log`);
+}
+
 function readPid(modelId: string): number | null {
   try {
     const raw = readFileSync(pidFile(modelId), "utf8").trim();
@@ -156,11 +218,21 @@ function processMatchesCmdline(pid: number, expectedPath: string): boolean {
   }
 }
 
+function clearPid(modelId: string): void {
+  try {
+    writeFileSync(pidFile(modelId), "");
+  } catch {
+    // Best effort.
+  }
+}
+
 export async function startServer(
   model: ManagedModel,
+  opts?: { port?: number; ctxSize?: number },
   onProgress: (message: string) => void = log,
 ): Promise<string> {
-  const serverPort = port();
+  const serverPort = opts?.port ?? settings().port;
+  const ctx = opts?.ctxSize ?? settings().ctxSize;
   const baseUrl = `http://127.0.0.1:${serverPort}`;
   if (await healthy(baseUrl)) {
     const pid = readPid(model.id);
@@ -170,7 +242,7 @@ export async function startServer(
       return baseUrl;
     }
     throw new Error(
-      `port ${serverPort} is already served by another process this manager did not start; stop it or set PI_LLAMAFILE_PORT`,
+      `port ${serverPort} is already served by another process this manager did not start; stop it or pick another port with /embedded-ai port <n>`,
     );
   }
   // Adopt a live leftover of ours (still loading) or spawn fresh.
@@ -181,39 +253,134 @@ export async function startServer(
     active = { pid: leftover, port: serverPort, modelId: model.id, path: model.path };
     return baseUrl;
   }
-  onProgress(`starting ${model.id} on ${baseUrl} (ctx ${ctxSize()})`);
-  const child = spawn("sh", [model.path, "--server", "--host", "127.0.0.1", "--port", String(serverPort), "--ctx-size", String(ctxSize())], {
-    stdio: "ignore",
-    detached: true,
-  });
+  onProgress(`starting ${model.id} on ${baseUrl} (ctx ${ctx})`);
+  const child = spawn(
+    "sh",
+    [model.path, "--server", "--host", "127.0.0.1", "--port", String(serverPort), "--ctx-size", String(ctx)],
+    { stdio: ["ignore", "pipe", "pipe"], detached: true },
+  );
   if (child.pid === undefined) throw new Error("could not start the llamafile server");
+  attachLogTap(model.id, child);
   try {
     writeFileSync(pidFile(model.id), String(child.pid));
   } catch {
     // Non-fatal: without a PID file a crash leftover just won't be adopted.
   }
-  child.unref?.();
+  (child as any).unref?.();
   await waitForHealth(baseUrl, onProgress);
   active = { pid: child.pid, port: serverPort, modelId: model.id, path: model.path };
   return baseUrl;
 }
 
-export function stopServer(): void {
+// ---------------------------------------------------------------------------
+// Server log: piped stdout/stderr into a bounded buffer, flushed to disk.
+// ---------------------------------------------------------------------------
+
+const LOG_LINES = 500;
+const logBuffers = new Map<string, string[]>();
+const logFlushed = new Map<string, number>();
+let logTimer: any = null;
+
+function appendLogLine(modelId: string, chunk: any): void {
+  const text = typeof chunk === "string" ? chunk : String(chunk);
+  const buffer = logBuffers.get(modelId) ?? [];
+  for (const line of text.split("\n")) {
+    if (line.length > 0) buffer.push(line);
+  }
+  while (buffer.length > LOG_LINES) buffer.shift();
+  logBuffers.set(modelId, buffer);
+}
+
+function flushLog(modelId: string): void {
+  const buffer = logBuffers.get(modelId) ?? [];
+  const done = logFlushed.get(modelId) ?? 0;
+  if (buffer.length <= done) return;
+  const fresh = buffer.slice(done).join("\n") + "\n";
+  let previous = "";
+  try {
+    previous = readFileSync(logFile(modelId), "utf8");
+  } catch {
+    // First write.
+  }
+  try {
+    mkdirSync(dirname(logFile(modelId)), { recursive: true });
+    writeFileSync(logFile(modelId), previous + fresh);
+    logFlushed.set(modelId, buffer.length);
+  } catch (error) {
+    log(`could not write server log: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function attachLogTap(modelId: string, child: any): void {
+  logBuffers.set(modelId, []);
+  logFlushed.set(modelId, 0);
+  const tap = (stream: any) => {
+    try {
+      stream?.on?.("data", (chunk: any) => appendLogLine(modelId, chunk));
+    } catch {
+      // Streams without events: logging is best-effort.
+    }
+  };
+  tap(child.stdout);
+  tap(child.stderr);
+  const pump = () => {
+    flushLog(modelId);
+    if (active?.modelId === modelId) {
+      logTimer = setTimeout(pump, 2000);
+    }
+  };
+  logTimer = setTimeout(pump, 2000);
+}
+
+async function waitForDown(baseUrl: string, timeoutMs = 20000): Promise<void> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!(await healthy(baseUrl))) return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`the llamafile server on ${baseUrl} did not stop within ${timeoutMs / 1000}s`);
+}
+
+export async function stopServer(): Promise<void> {
   if (!active) return;
-  const { pid } = active;
+  const { pid, modelId, port } = active;
   active = null;
+  flushLog(modelId);
   if (pid === null) return;
   try {
     process.kill(pid, "SIGTERM");
   } catch {
     // Already gone: nothing to do.
   }
-  try {
-    writeFileSync(pidFile(pid.toString()), "");
-  } catch {
-    // Best effort cleanup.
-  }
+  clearPid(modelId);
+  await waitForDown(`http://127.0.0.1:${port}`);
 }
+
+/** Probe every discovered model: running (healthy), loading (PID but unhealthy), or stopped. */
+export async function serverStatus(): Promise<string> {
+  const models = discoverModels();
+  if (models.length === 0) return "no .llamafile discovered";
+  const lines: string[] = [];
+  for (const model of models) {
+    const pid = readPid(model.id);
+    const alive = pid !== null && processMatchesCmdline(pid, model.path);
+    const mark = active?.modelId === model.id ? " [active]" : "";
+    if (!alive) {
+      lines.push(`${model.id}${mark}: stopped`);
+      continue;
+    }
+    // Find which port answers: ours, by matching the PID's listening socket is racy;
+    // probe the configured port and report health.
+    const baseUrl = `http://127.0.0.1:${settings().port}`;
+    const up = await healthy(baseUrl);
+    lines.push(`${model.id}${mark}: pid ${pid}, ${up ? `healthy on ${baseUrl}` : "loading..."}`);
+  }
+  return lines.join("\n");
+}
+
+// ---------------------------------------------------------------------------
+// Provider registration (models.json persistence for OOTB default).
+// ---------------------------------------------------------------------------
 
 function agentModelsPath(): string {
   // The default agent dir; a custom PI_CONFIG_DIR build resolves elsewhere (documented limit).
@@ -254,10 +421,11 @@ function writeManagedProvider(models: any[]): void {
     log("models.json has a user-managed embedded-ai provider; leaving it alone");
     return;
   }
+  const { port } = settings();
   delete file.providers[LEGACY_PROVIDER_ID];
   file.providers[PROVIDER_ID] = {
     name: "embedded AI (local)",
-    baseUrl: `http://127.0.0.1:${port()}/v1`,
+    baseUrl: `http://127.0.0.1:${port}/v1`,
     apiKey: "local",
     api: "openai-completions",
     models,
@@ -266,7 +434,7 @@ function writeManagedProvider(models: any[]): void {
   writeFileSync(agentModelsPath(), JSON.stringify(file, null, 2) + "\n");
 }
 
-async function fetchModels(baseUrl: string): Promise<any[]> {
+async function fetchModels(baseUrl: string, ctx: number): Promise<any[]> {
   const response = await fetch(`${baseUrl}/models`);
   if (!response.ok) throw new Error(`llamafile server returned HTTP ${response.status}`);
   const payload: any = await response.json();
@@ -284,8 +452,8 @@ async function fetchModels(baseUrl: string): Promise<any[]> {
         reasoning: true,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: ctxSize(),
-        maxTokens: ctxSize(),
+        contextWindow: ctx,
+        maxTokens: ctx,
       };
     })
     .filter(Boolean);
@@ -298,58 +466,128 @@ function providerConfig(baseUrl: string, models: any[]) {
     apiKey: "local",
     baseUrl: `${baseUrl}/v1`,
     models,
-    refreshModels: async () => fetchModels(baseUrl),
+    refreshModels: async () => fetchModels(baseUrl, settings().ctxSize),
   };
 }
 
-export default function piLlamafileExtension(pi: ExtensionAPI) {
-  const packageDir = dirname(new URL(import.meta.url).pathname);
+async function registerRunning(model: ManagedModel, baseUrl: string): Promise<string> {
+  const { ctxSize } = settings();
+  const models = await fetchModels(baseUrl, ctxSize);
+  writeManagedProvider(models);
+  api?.registerProvider(PROVIDER_ID, providerConfig(baseUrl, models));
+  return `${model.id} ready at ${baseUrl}`;
+}
+
+async function switchTo(model: ManagedModel): Promise<string> {
+  if (active && active.modelId !== model.id) await stopServer();
+  saveSettings({ modelId: model.id });
+  const baseUrl = await startServer(model);
+  return registerRunning(model, baseUrl);
+}
+
+const USAGE = `usage: /embedded-ai [list|status|start [name]|use <name>|stop|ctx <n>|port <n>|logs [n]]
+  list          discovered llamafile models
+  status        servers: running, loading or stopped
+  start [name]  serve a model (default: preferred or first discovered)
+  use <name>    switch to a model (restarts the server, remembers the choice)
+  stop          terminate the managed server
+  ctx <n>       set context size (min 1024) and restart the server
+  port <n>      set port (1-65535) and restart the server
+  logs [n]      last n lines of the server log (default 30)`;
+
+export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
+  api = pi;
+  packageDir = dirname(new URL(import.meta.url).pathname);
   pi.registerCommand("embedded-ai", {
-    description: "Manage local AI models (llamafile): list, start, stop, status",
+    description: "Manage local AI models: list, start, use, stop, ctx, port, status, logs",
     handler: async (args: string[]) => {
       const [sub, ...rest] = args;
-      const models = discoverModels(packageDir);
+      const models = discoverModels();
       if (sub === "list" || !sub) {
         if (models.length === 0) return "no .llamafile found (PI_LLAMAFILE_DIR, ~/.pi/agent/models, ~/models)";
-        return models.map((model) => `${model.id}\n  ${model.path}`).join("\n");
+        const preferred = settings().modelId;
+        return models
+          .map((model) => `${model.id}${model.id === preferred ? " [preferred]" : ""}${active?.modelId === model.id ? " [active]" : ""}\n  ${model.path}`)
+          .join("\n");
       }
-      if (sub === "status") {
-        if (!active) return "no llamafile server managed by this extension";
-        const up = await healthy(`http://127.0.0.1:${active.port}`);
-        return `${active.modelId} on port ${active.port} (pid ${active.pid}): ${up ? "healthy" : "not responding"}`;
+      if (sub === "status") return serverStatus();
+      if (sub === "logs") {
+        const n = parseInt(rest[0] ?? "30", 10);
+        const target = active?.modelId ?? settings().modelId ?? models[0]?.id;
+        if (!target) return "no model selected yet";
+        try {
+          const content = readFileSync(logFile(target), "utf8").trim().split("\n");
+          return content.slice(-(Number.isInteger(n) && n > 0 ? n : 30)).join("\n") || "(empty log)";
+        } catch {
+          return `(no log file for ${target} yet)`;
+        }
       }
       if (sub === "start") {
         const wanted = rest[0];
-        const model = wanted ? models.find((candidate) => candidate.id === wanted) : models[0];
+        const preferred = settings().modelId;
+        const model =
+          (wanted && models.find((candidate) => candidate.id === wanted)) ??
+          models.find((candidate) => candidate.id === preferred) ??
+          models[0];
         if (!model) return wanted ? `no llamafile named ${wanted}` : "no .llamafile found";
+        if (active && active.modelId === model.id && (await healthy(`http://127.0.0.1:${active.port}`))) {
+          return `${model.id} already running`;
+        }
         const baseUrl = await startServer(model);
-        pi.registerProvider(PROVIDER_ID, providerConfig(baseUrl, await fetchModels(baseUrl)));
-        return `${model.id} ready at ${baseUrl}`;
+        return registerRunning(model, baseUrl);
+      }
+      if (sub === "use") {
+        const wanted = rest[0];
+        if (!wanted) return "usage: /embedded-ai use <name>";
+        const model = models.find((candidate) => candidate.id === wanted);
+        if (!model) return `no llamafile named ${wanted}`;
+        return switchTo(model);
       }
       if (sub === "stop") {
-        stopServer();
-        pi.unregisterProvider(PROVIDER_ID);
-        return "llamafile server stopped";
+        const was = active?.modelId;
+        await stopServer();
+        api?.unregisterProvider(PROVIDER_ID);
+        return was ? `${was} stopped` : "no managed server was running";
       }
-      return "usage: /embedded-ai [list|start [name]|stop|status]";
+      if (sub === "ctx" || sub === "port") {
+        const value = parseInt(rest[0] ?? "", 10);
+        if (sub === "ctx" && (!Number.isInteger(value) || value < 1024)) return "usage: /embedded-ai ctx <n>  (n >= 1024)";
+        if (sub === "port" && (!Number.isInteger(value) || value < 1 || value > 65535)) {
+          return "usage: /embedded-ai port <n>  (1-65535)";
+        }
+        const patch = sub === "ctx" ? { ctxSize: value } : { port: value };
+        const next = saveSettings(patch);
+        // Restart the running server (or the preferred model) with the new setting.
+        const current =
+          (active && models.find((candidate) => candidate.id === active?.modelId)) ??
+          models.find((candidate) => candidate.id === next.modelId) ??
+          models[0];
+        if (!current) return "no .llamafile found";
+        await stopServer();
+        // A port change moves the provider URL: drop the stale registration first.
+        if (sub === "port") api?.unregisterProvider(PROVIDER_ID);
+        const baseUrl = await startServer(current, sub === "port" ? { port: next.port } : { ctxSize: next.ctxSize });
+        return registerRunning(current, baseUrl);
+      }
+      return USAGE;
     },
   });
 
-  // Auto-start the first discovered model and register it as the local provider.
+  // Auto-start the preferred (or first discovered) model and register it as the local provider.
   // A missing model is not fatal: the extension loads, start is manual via /embedded-ai.
   // A previously persisted provider registers synchronously so the first model
   // resolution already sees it; the running server is ensured in the background.
   const persisted = managedEntry();
   if (persisted?.models?.length) {
-    pi.registerProvider(PROVIDER_ID, providerConfig(`http://127.0.0.1:${port()}`, persisted.models));
+    api?.registerProvider(PROVIDER_ID, providerConfig(`http://127.0.0.1:${settings().port}`, persisted.models));
   }
-  const [first] = discoverModels(packageDir);
-  if (first) {
-    startServer(first)
+  const { modelId } = settings();
+  const preferred =
+    discoverModels().find((candidate) => candidate.id === modelId) ?? discoverModels()[0];
+  if (preferred) {
+    startServer(preferred)
       .then(async (baseUrl) => {
-        const models = await fetchModels(baseUrl);
-        writeManagedProvider(models);
-        pi.registerProvider(PROVIDER_ID, providerConfig(baseUrl, models));
+        await registerRunning(preferred, baseUrl);
       })
       .catch((error: unknown) => log(`auto-start skipped: ${error instanceof Error ? error.message : String(error)}`));
   } else {
