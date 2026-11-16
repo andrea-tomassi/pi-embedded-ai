@@ -4,6 +4,24 @@
   "description": "Local AI manager for pi: discovers llamafile models and cortiq .cmf files, runs their servers, registers them as local providers",
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andrea-tomassi/pi-embedded-ai.git"
+  },
+  "files": [
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  },
   "exports": {
     ".": "./src/extension.ts"
   },
