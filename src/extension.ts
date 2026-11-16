@@ -497,6 +497,20 @@ function spawnSpec(model: ManagedModel, port: number, ctx: number, gpu: string):
   };
 }
 
+/** The model file the engine on `baseUrl` is serving, when it can tell us
+ * (cortiq exposes it on the status endpoint; llamafile does not). */
+async function servedModelPath(engine: EngineSpec, baseUrl: string): Promise<string | null> {
+  if (engine.id !== "cortiq") return null;
+  try {
+    const response = await fetch(`${baseUrl}/v1/cortiq/status`);
+    if (!response.ok) return null;
+    const payload: any = await response.json();
+    return typeof payload?.model_path === "string" ? payload.model_path : null;
+  } catch {
+    return null;
+  }
+}
+
 export async function startServer(
   model: ManagedModel,
   opts?: { port?: number; ctxSize?: number },
@@ -510,9 +524,19 @@ export async function startServer(
   if (await healthy(engine, baseUrl)) {
     const pid = readPid(engine, model.id);
     if (pid !== null && processMatchesCmdline(pid, model.path)) {
-      active[model.engine] = { pid, port: serverPort, modelId: model.id, path: model.path };
-      onProgress(`adopting ${engine.label} server on ${baseUrl} (pid ${pid})`);
-      return baseUrl;
+      // A pid-file match does not prove the served weights: a server listens
+      // with whatever file it was started with. cortiq tells us; on a mismatch
+      // stop it and spawn the requested model instead of adopting the wrong one.
+      const serving = await servedModelPath(engine, baseUrl);
+      if (serving !== null && serving !== model.path) {
+        onProgress(`port ${serverPort} serves ${basename(serving)}; restarting for ${model.id}`);
+        await stopModel(model, serverPort);
+        clearPid(engine, model.id);
+      } else {
+        active[model.engine] = { pid, port: serverPort, modelId: model.id, path: model.path };
+        onProgress(`adopting ${engine.label} server on ${baseUrl} (pid ${pid})`);
+        return baseUrl;
+      }
     }
     throw new Error(
       `port ${serverPort} is already served by another process this manager did not start; stop it or pick another port with /${engine.command} port <n>`,

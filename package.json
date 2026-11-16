@@ -1,6 +1,6 @@
 {
   "name": "pi-embedded-ai",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Local AI manager for pi: discovers llamafile models and cortiq .cmf files, runs their servers, registers them as local providers",
   "license": "MIT",
   "type": "module",
