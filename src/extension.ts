@@ -787,33 +787,45 @@ async function fetchModels(engine: EngineSpec, baseUrl: string, ctx: number, rea
         api: "openai-completions",
         provider: engine.providerId,
         baseUrl: `${baseUrl}/v1`,
-        // llamafile models may reason; a cortiq chat model is a plain completion model.
         reasoning,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: ctx,
         maxTokens: ctx,
+        // cortiq takes `enable_thinking` and ignores reasoning_effort, so the host's thinking
+        // level drives the chat-template flag: off means no `<think>`, every other level means
+        // think. Without this the model always thought, whatever level the user picked.
+        ...(engine.id === "cortiq"
+          ? {
+              compat: {
+                thinkingFormat: "chat-template",
+                chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" } },
+                supportsReasoningEffort: false,
+              },
+            }
+          : {}),
       };
     })
     .filter(Boolean);
 }
 
 function providerConfig(engine: EngineSpec, baseUrl: string, models: any[]) {
-  const reasoning = engine.id === "llamafile";
   return {
     id: engine.providerId,
     name: engine.providerName,
     apiKey: "local",
     baseUrl: `${baseUrl}/v1`,
     models,
-    refreshModels: async () => fetchModels(engine, baseUrl, settings(engine.id).ctxSize, reasoning),
+    refreshModels: async () => fetchModels(engine, baseUrl, settings(engine.id).ctxSize, true),
   };
 }
 
 async function registerRunning(model: ManagedModel, baseUrl: string): Promise<string> {
   const engine = ENGINES[model.engine];
   const { ctxSize } = settings(model.engine);
-  const models = await fetchModels(engine, baseUrl, ctxSize, engine.id === "llamafile");
+  // Both engines expose thinking controls to the host: llamafile through llama.cpp's own
+  // reasoning fields, cortiq through the chat-template flag wired in fetchModels.
+  const models = await fetchModels(engine, baseUrl, ctxSize, true);
   writeManagedProvider(engine, models);
   api?.registerProvider(engine.providerId, providerConfig(engine, baseUrl, models));
   return `${model.id} ready at ${baseUrl}`;
