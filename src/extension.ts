@@ -1001,9 +1001,16 @@ async function autoStart() {
     if (!pick) continue;
     return { engineId, model: pick };
   }
-  // Nothing persisted: prefer a llamafile (the historical default), else a CMF.
+  // Nothing persisted: an engine with an explicit model choice wins over the default order, so a
+  // `/cortiq use <name>` (or a distro install that pins one) is not silently overridden by a
+  // leftover model of the other engine. Then the historical default: llamafile, then cortiq.
   for (const engineId of ENGINE_IDS) {
-    const pick = discoverModels(engineId).find((candidate) => candidate.id === settings(engineId).modelId) ?? discoverModels(engineId)[0];
+    const wanted = settings(engineId).modelId;
+    const pick = discoverModels(engineId).find((candidate) => candidate.id === wanted);
+    if (pick) return { engineId, model: pick };
+  }
+  for (const engineId of ENGINE_IDS) {
+    const pick = discoverModels(engineId)[0];
     if (pick) return { engineId, model: pick };
   }
   return null;
