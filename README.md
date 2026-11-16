@@ -92,7 +92,7 @@ build it fails at the first request, so leave `default` for the bundled binary.
 | `PI_CORTIQ_DIR`    | —       | extra directory to discover `.cmf` in |
 | `PI_CORTIQ_BIN`    | —       | cortiq executable (else `cortiq`, `cortiq-cpu` from `PATH`) |
 | `PI_CORTIQ_PORT`   | 8081    | port the cortiq server listens on     |
-| `PI_CORTIQ_CTX`    | 32768   | context size, passed as `CMF_MAX_SEQ` |
+| `PI_CORTIQ_CTX`    | 131072  | context size, passed as `CMF_MAX_SEQ` |
 | `PI_CORTIQ_GPU`    | default | `CMF_GPU`: `default`, `cpu`, `cuda`, `wgpu` |
 
 ## Runtime

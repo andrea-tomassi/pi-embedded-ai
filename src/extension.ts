@@ -88,7 +88,7 @@ const ENGINES: Record<EngineId, EngineSpec> = {
     settingsFile: "cortiq.json",
     envPrefix: "PI_CORTIQ",
     defaultPort: 8081,
-    defaultCtx: 32768,
+    defaultCtx: 131072,
     ctxIsEnv: true,
     label: "cortiq",
   },
