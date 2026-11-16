@@ -1,12 +1,17 @@
 # pi-embedded-ai
 
-Local AI manager (llamafile-based) for [pi](https://github.com/earendil-works/pi)
-(and the pi-rust port). Discovers `.llamafile` executables on the host, serves
-them as a local OpenAI-compatible provider, and registers the selected one as
-the out-of-the-box local model.
+Local AI manager for [pi](https://github.com/earendil-works/pi) (and the
+pi-rust port). Two engines share one lifecycle, each with its own provider, so
+they can run side by side:
 
-**No weights are bundled.** Models ship separately (see [awesome-llamafiles](https://github.com/andrea-tomassi/awesome-llamafiles))
-and are discovered at runtime. This package is MIT.
+| Engine | Shape | Provider | Command |
+|--------|-------|----------|---------|
+| **llamafile** | a `.llamafile` executable that *is* the model | `embedded-ai` | `/embedded-ai` |
+| **cortiq** | a `cortiq` binary plus `.cmf` model files | `cortiq` | `/cortiq` |
+
+**No weights are bundled.** Models ship separately (see [awesome-llamafiles](https://github.com/andrea-tomassi/awesome-llamafiles)
+for llamafiles, any CMF distribution for cortiq) and are discovered at runtime.
+This package is MIT.
 
 ## Install
 
@@ -20,16 +25,24 @@ pi install ./pi-embedded-ai/
 
 On load the extension scans, in order:
 
-1. `PI_LLAMAFILE_DIR` (explicit override)
+1. `PI_LLAMAFILE_DIR` / `PI_CORTIQ_DIR` (explicit override, per engine)
 2. `~/.pi/agent/models/`
 3. `~/models/` (one level of subdirectories)
 4. the package directory itself
 
 The first valid `.llamafile` is started (`--server --host 127.0.0.1
 --port $PI_LLAMAFILE_PORT --ctx-size $PI_LLAMAFILE_CTX`, defaults 8080 and
-128k) and registered as the `embedded-ai` provider. A port held by anything else
-is reported, never reused or killed. Crash leftovers are adopted through a PID
-file; stopping the extension (or the host) terminates the server.
+128k) and registered as the `embedded-ai` provider. `.cmf` files are served by
+the `cortiq` binary (`cortiq serve <model> --host 127.0.0.1 --port
+$PI_CORTIQ_PORT`, defaults 8081, context through `CMF_MAX_SEQ`) and registered
+as the `cortiq` provider.
+
+A port held by anything else is reported, never reused or killed. Crash
+leftovers are adopted through a PID file; stopping the extension (or the host)
+terminates the server.
+
+The cortiq binary is looked up as `PI_CORTIQ_BIN`, then `cortiq`, then
+`cortiq-cpu` in `PATH` — the airgapped bundle installs it under the second name.
 
 ## Commands
 
@@ -48,8 +61,26 @@ each subcommand reports its result as a notification.
 ```
 
 Settings persist in `~/.pi/agent/llamafile.json` (`port`, `ctxSize`,
-`modelId`); `PI_LLAMAFILE_PORT`, `PI_LLAMAFILE_CTX`, `PI_LLAMAFILE_MODEL`
-env vars override them (the commands say so when this happens).
+`modelId`) and `~/.pi/agent/cortiq.json` (`port`, `ctxSize`, `modelId`, `gpu`);
+the `PI_LLAMAFILE_*` / `PI_CORTIQ_*` env vars override them (the commands say so
+when this happens).
+
+### cortiq
+
+```
+/cortiq list               discovered .cmf models ([preferred], [active], gpu mode)
+/cortiq status             servers: running, loading or stopped
+/cortiq start [name]       serve a model (default: preferred or first discovered)
+/cortiq use <name>         switch to a model (restarts the server, remembers the choice)
+/cortiq stop               terminate the managed server
+/cortiq ctx <n>            set context size (min 1024, passed as CMF_MAX_SEQ) and restart
+/cortiq port <n>           set port (1-65535) and restart the server
+/cortiq gpu <mode>         default | cpu | cuda | wgpu (sets CMF_GPU) and restart
+/cortiq logs [n]           last n lines of the server log (default 30)
+```
+
+`cortiq gpu cuda` needs a binary built with `--features cuda`; on a CPU-only
+build it fails at the first request, so leave `default` for the bundled binary.
 
 ## Settings
 
@@ -58,6 +89,11 @@ env vars override them (the commands say so when this happens).
 | `PI_LLAMAFILE_DIR` | —       | extra directory to discover models in |
 | `PI_LLAMAFILE_PORT`| 8080    | port the managed server listens on    |
 | `PI_LLAMAFILE_CTX` | 131072  | context size (KV cache ≈ RAM use)     |
+| `PI_CORTIQ_DIR`    | —       | extra directory to discover `.cmf` in |
+| `PI_CORTIQ_BIN`    | —       | cortiq executable (else `cortiq`, `cortiq-cpu` from `PATH`) |
+| `PI_CORTIQ_PORT`   | 8081    | port the cortiq server listens on     |
+| `PI_CORTIQ_CTX`    | 32768   | context size, passed as `CMF_MAX_SEQ` |
+| `PI_CORTIQ_GPU`    | default | `CMF_GPU`: `default`, `cpu`, `cuda`, `wgpu` |
 
 ## Runtime
 
