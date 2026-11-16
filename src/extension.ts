@@ -386,6 +386,26 @@ function tryLock(engine: EngineSpec, modelId: string, port: number): boolean {
     writeFileSync(lockFile(engine, modelId, port), String(process.pid), { flag: "wx" });
     return true;
   } catch {
+    // A hard-killed session leaves its lock behind; a lock whose owner is gone is not a lock.
+    try {
+      const owner = parseInt(readFileSync(lockFile(engine, modelId, port), "utf8").trim(), 10);
+      if (Number.isInteger(owner) && owner > 0 && !processAlive(owner)) {
+        unlinkSync(lockFile(engine, modelId, port));
+        writeFileSync(lockFile(engine, modelId, port), String(process.pid), { flag: "wx" });
+        return true;
+      }
+    } catch {
+      // Someone else won the retry: fall through and wait for them.
+    }
+    return false;
+  }
+}
+
+function processAlive(pid: number): boolean {
+  // /proc is already the source of truth for every other check in this file.
+  try {
+    return statSync(`/proc/${pid}`).isDirectory();
+  } catch {
     return false;
   }
 }
@@ -446,7 +466,10 @@ function spawnSpec(model: ManagedModel, port: number, ctx: number, gpu: string):
     throw new Error("cortiq not found: put it in PATH, install it as cortiq-cpu, or set PI_CORTIQ_BIN");
   }
   const env: Record<string, string> = { CMF_MAX_SEQ: String(ctx) };
-  if (gpu === "cpu" || gpu === "cuda" || gpu === "wgpu") env["CMF_GPU"] = gpu;
+  // The engine reads `CMF_GPU=0` as "CPU" and treats *any* other value as "use the wgpu GPU",
+  // so a literal `cpu` would silently try Vulkan and drop the request on a host without one.
+  if (gpu === "cpu") env["CMF_GPU"] = "0";
+  else if (gpu === "cuda" || gpu === "wgpu") env["CMF_GPU"] = gpu;
   return {
     cmd: binary,
     args: ["serve", model.path, "--host", "127.0.0.1", "--port", String(port)],

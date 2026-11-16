@@ -79,8 +79,9 @@ when this happens).
 /cortiq logs [n]           last n lines of the server log (default 30)
 ```
 
-`cortiq gpu cuda` needs a binary built with `--features cuda`; on a CPU-only
-build it fails at the first request, so leave `default` for the bundled binary.
+`gpu cpu` is passed to the engine as `CMF_GPU=0`: the engine reads only `0` (or `off`)
+as CPU and treats any other value as "use the wgpu GPU". `cuda` needs a binary built
+with `--features cuda`; the bundled CPU build has no GPU backend at all.
 
 ## Settings
 
