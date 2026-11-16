@@ -6,8 +6,8 @@ they can run side by side:
 
 | Engine | Shape | Provider | Command |
 |--------|-------|----------|---------|
-| **llamafile** | a `.llamafile` executable that *is* the model | `embedded-ai` | `/embedded-ai` |
-| **cortiq** | a `cortiq` binary plus `.cmf` model files | `cortiq` | `/cortiq` |
+| **llamafile** | a `.llamafile` executable that *is* the model | `embedded-ai` | `/embedded-llama` |
+| **cortiq** | a `cortiq` binary plus `.cmf` model files | `cortiq` | `/embedded-cortiq` |
 
 **No weights are bundled.** Models ship separately (see [awesome-llamafiles](https://github.com/andrea-tomassi/awesome-llamafiles)
 for llamafiles, any CMF distribution for cortiq) and are discovered at runtime.
@@ -68,16 +68,18 @@ when this happens).
 ### cortiq
 
 ```
-/cortiq list               discovered .cmf models ([preferred], [active], gpu mode)
-/cortiq status             servers: running, loading or stopped
-/cortiq start [name]       serve a model (default: preferred or first discovered)
-/cortiq use <name>         switch to a model (restarts the server, remembers the choice)
-/cortiq stop               terminate the managed server
-/cortiq ctx <n>            set context size (min 1024, passed as CMF_MAX_SEQ) and restart
-/cortiq port <n>           set port (1-65535) and restart the server
-/cortiq gpu <mode>         default | cpu | cuda | wgpu (sets CMF_GPU) and restart
-/cortiq logs [n]           last n lines of the server log (default 30)
+/embedded-cortiq list      discovered .cmf models ([preferred], [active], gpu mode)
+/embedded-cortiq status    servers: running, loading or stopped
+/embedded-cortiq start     serve the preferred or first discovered model
+/embedded-cortiq stop      terminate the managed server
+/embedded-cortiq ctx <n>   set context size (min 1024, passed as CMF_MAX_SEQ) and restart
+/embedded-cortiq port <n>  set port (1-65535) and restart the server
+/embedded-cortiq gpu <m>   default | cpu | cuda | wgpu (sets CMF_GPU) and restart
+/embedded-cortiq logs [n]  last n lines of the server log (default 30)
 ```
+
+`use <name>` and `start <name>` still accept an explicit model name for
+scripting, but the `/set-*` commands are the intended interface.
 
 `gpu cpu` is passed to the engine as `CMF_GPU=0`: the engine reads only `0` (or `off`)
 as CPU and treats any other value as "use the wgpu GPU". `cuda` needs a binary built

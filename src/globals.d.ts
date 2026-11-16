@@ -18,6 +18,7 @@ declare module "node:os" {
   export function tmpdir(): string;
 }
 declare module "node:path" {
+  export function basename(p: string): string;
   export function dirname(p: string): string;
   export function join(...parts: string[]): string;
   export function resolve(...parts: string[]): string;

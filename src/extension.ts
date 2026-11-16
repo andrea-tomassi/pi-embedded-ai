@@ -13,7 +13,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, readlinkSync, statSync, unlinkSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 const MANAGER_ID = "pi-embedded-ai";
 const HEALTH_TIMEOUT_MS = 180000;
@@ -46,6 +46,8 @@ interface EngineSpec {
   id: EngineId;
   /** Provider id registered in models.json and with the host. */
   providerId: string;
+  /** The management command name (`/embedded-llama`, `/embedded-cortiq`). */
+  command: string;
   /** Older provider keys this engine may have used, migrated on first write. */
   legacyProviderIds: string[];
   providerName: string;
@@ -67,6 +69,7 @@ const ENGINES: Record<EngineId, EngineSpec> = {
   llamafile: {
     id: "llamafile",
     providerId: "embedded-ai",
+    command: "embedded-llama",
     legacyProviderIds: ["llamafile"],
     providerName: "embedded AI (local)",
     extension: ".llamafile",
@@ -81,6 +84,7 @@ const ENGINES: Record<EngineId, EngineSpec> = {
   cortiq: {
     id: "cortiq",
     providerId: "cortiq",
+    command: "embedded-cortiq",
     legacyProviderIds: [],
     providerName: "cortiq (local)",
     extension: ".cmf",
@@ -166,6 +170,17 @@ function scanDir(engine: EngineSpec, dir: string, depth: number): ManagedModel[]
     }
   }
   return found;
+}
+
+/** Command slug for a model: the file stem, lowercase, kept to [a-z0-9._-].
+ * `LFM3-1.7B-QAD-Q4_0.llamafile` -> `lfm3-1.7b-qad-q4_0` (command: /set-lfm3-1.7b-qad-q4_0). */
+function modelSlug(model: ManagedModel): string {
+  const stem = basename(model.path).replace(/\.(llamafile|cmf)$/i, "");
+  return stem
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
 }
 
 export function discoverModels(engineId: EngineId = "llamafile"): ManagedModel[] {
@@ -495,7 +510,7 @@ export async function startServer(
       return baseUrl;
     }
     throw new Error(
-      `port ${serverPort} is already served by another process this manager did not start; stop it or pick another port with /${engine.providerId} port <n>`,
+      `port ${serverPort} is already served by another process this manager did not start; stop it or pick another port with /${engine.command} port <n>`,
     );
   }
   // Adopt a live leftover of ours (still loading) or spawn fresh.
@@ -833,6 +848,10 @@ async function registerRunning(model: ManagedModel, baseUrl: string): Promise<st
 
 async function switchTo(model: ManagedModel): Promise<string> {
   return serialize(async () => {
+    // The model servers are mutually exclusive: one RAM budget, one model in
+    // memory at a time. Starting an engine stops the other one (and drops its
+    // provider, so no dead endpoint lingers in models.json).
+    await stopOtherEngines(model.engine);
     if (active[model.engine] && active[model.engine]!.modelId !== model.id) await stopServer(model.engine);
     saveSettings({ modelId: model.id }, model.engine);
     const baseUrl = await startServer(model);
@@ -840,8 +859,18 @@ async function switchTo(model: ManagedModel): Promise<string> {
   });
 }
 
+/** Stop every engine other than `engineId` (and drop their providers). Safe when
+ * nothing of theirs runs. */
+async function stopOtherEngines(engineId: EngineId): Promise<void> {
+  for (const other of ENGINE_IDS) {
+    if (other === engineId) continue;
+    await stopServer(other);
+    api?.unregisterProvider(ENGINES[other].providerId);
+  }
+}
+
 function usageFor(engine: EngineSpec): string {
-  const head = `usage: /${engine.providerId} [list|status|start [name]|use <name>|stop|ctx <n>|port <n>|logs [n]${engine.id === "cortiq" ? "|gpu <default|cpu|cuda|wgpu>" : ""}]`;
+  const head = `usage: /${engine.command} [list|status|start|stop|ctx <n>|port <n>|logs [n]${engine.id === "cortiq" ? "|gpu <default|cpu|cuda|wgpu>" : ""}]\n  or /set-<model>  (one command per discovered model: switching never needs a name)\n  note: starting this engine stops the other one`;
   const lines = [
     `  list          discovered ${engine.id} models`,
     "  status        servers: running, loading or stopped",
@@ -927,13 +956,19 @@ function commandHandler(engineId: EngineId) {
           return;
         }
         say("starting...");
-        say(await serialize(async () => registerRunning(model, await startServer(model))));
+        say(
+          await serialize(async () => {
+            // One engine at a time: a start implies the other engine is down.
+            await stopOtherEngines(engineId);
+            return registerRunning(model, await startServer(model));
+          }),
+        );
         return;
       }
       if (sub === "use") {
         const wanted = rest[0];
         if (!wanted) {
-          fail(`usage: /${engine.providerId} use <name>`);
+          fail(`usage: /${engine.command} use <name>  (or just /set-<model>)`);
           return;
         }
         const model = models.find((candidate) => candidate.id === wanted);
@@ -955,11 +990,11 @@ function commandHandler(engineId: EngineId) {
       if (sub === "ctx" || sub === "port") {
         const value = parseInt(rest[0] ?? "", 10);
         if (sub === "ctx" && (!Number.isInteger(value) || value < 1024)) {
-          fail(`usage: /${engine.providerId} ctx <n>  (n >= 1024)`);
+          fail(`usage: /${engine.command} ctx <n>  (n >= 1024)`);
           return;
         }
         if (sub === "port" && (!Number.isInteger(value) || value < 1 || value > 65535)) {
-          fail(`usage: /${engine.providerId} port <n>  (1-65535)`);
+          fail(`usage: /${engine.command} port <n>  (1-65535)`);
           return;
         }
         const patch = sub === "ctx" ? { ctxSize: value } : { port: value };
@@ -990,7 +1025,7 @@ function commandHandler(engineId: EngineId) {
       if (sub === "gpu" && engine.id === "cortiq") {
         const mode = (rest[0] ?? "").toLowerCase();
         if (!["default", "cpu", "cuda", "wgpu"].includes(mode)) {
-          fail(`usage: /${engine.providerId} gpu <default|cpu|cuda|wgpu>`);
+          fail(`usage: /${engine.command} gpu <default|cpu|cuda|wgpu>`);
           return;
         }
         const next = saveSettings({ gpu: mode }, engineId);
@@ -1051,14 +1086,46 @@ async function autoStart() {
 export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
   api = pi;
   packageDir = dirname(new URL(import.meta.url).pathname);
-  pi.registerCommand("embedded-ai", {
-    description: "Manage local llamafile models: list, start, use, stop, ctx, port, status, logs",
+  pi.registerCommand("embedded-llama", {
+    description: "Manage local llamafile models: list, start, stop, ctx, port, status, logs",
     handler: commandHandler("llamafile"),
   });
-  pi.registerCommand("cortiq", {
-    description: "Manage local cortiq (.cmf) models: list, start, use, stop, ctx, port, gpu, status, logs",
+  pi.registerCommand("embedded-cortiq", {
+    description: "Manage local cortiq (.cmf) models: list, start, stop, ctx, port, gpu, status, logs",
     handler: commandHandler("cortiq"),
   });
+
+  // One `set-<model>` command per discovered model, so switching never needs a
+  // typed name. The slug is the model file stem (lowercase); a cross-engine
+  // duplicate gets the engine appended.
+  const usedSlugs = new Set<string>();
+  for (const engineId of ENGINE_IDS) {
+    for (const model of discoverModels(engineId)) {
+      let slug = modelSlug(model);
+      if (usedSlugs.has(slug)) slug = `${slug}-${engineId}`;
+      if (usedSlugs.has(slug)) continue;
+      usedSlugs.add(slug);
+      const engine = ENGINES[engineId];
+      pi.registerCommand(`set-${slug}`, {
+        description: `Start and use ${model.id} (${engine.label}); stops the other engine`,
+        handler: async (_rawArgs: string, ctx: any) => {
+          const say = (text: string) => ctx?.ui?.notify?.(text, "info");
+          const fail = (text: string) => ctx?.ui?.notify?.(text, "error");
+          const fresh = discoverModels(engineId).find((candidate) => candidate.path === model.path);
+          if (!fresh) {
+            fail(`model file gone: ${model.path}`);
+            return;
+          }
+          say(`switching to ${fresh.id}...`);
+          try {
+            say(await switchTo(fresh));
+          } catch (err) {
+            fail(String(err));
+          }
+        },
+      });
+    }
+  }
 
   // Auto-start the preferred (or first discovered) model and register it as the local provider.
   // A missing model is not fatal: the extension loads, start is manual via /embedded-ai or /cortiq.
