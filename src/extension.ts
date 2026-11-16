@@ -161,7 +161,7 @@ function scanDir(engine: EngineSpec, dir: string, depth: number): ManagedModel[]
     }
     if (stat.isFile() && entry.endsWith(engine.extension)) {
       found.push({
-        id: entry.slice(0, entry.length - engine.extension.length),
+        id: stemSlug(entry.slice(0, entry.length - engine.extension.length)),
         path: full,
         engine: engine.id,
       });
@@ -172,15 +172,20 @@ function scanDir(engine: EngineSpec, dir: string, depth: number): ManagedModel[]
   return found;
 }
 
-/** Command slug for a model: the file stem, lowercase, kept to [a-z0-9._-].
- * `LFM3-1.7B-QAD-Q4_0.llamafile` -> `lfm3-1.7b-qad-q4_0` (command: /set-lfm3-1.7b-qad-q4_0). */
-function modelSlug(model: ManagedModel): string {
-  const stem = basename(model.path).replace(/\.(llamafile|cmf)$/i, "");
+/** A model id everywhere: the file stem, lowercase, kept to [a-z0-9._-].
+ * `LFM3-1.7B-QAD-Q4_0.llamafile` -> `lfm3-1.7b-qad-q4_0`. Two quants of one
+ * family (lfm3-1.7b-q4tp, lfm3-1.7b-q8_2f) stay distinct, and the id doubles
+ * as the /set argument. */
+function stemSlug(stem: string): string {
   return stem
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
+}
+
+function modelSlug(model: ManagedModel): string {
+  return stemSlug(basename(model.path).replace(/\.(llamafile|cmf)$/i, ""));
 }
 
 export function discoverModels(engineId: EngineId = "llamafile"): ManagedModel[] {
@@ -785,43 +790,49 @@ function writeManagedProvider(engine: EngineSpec, models: any[]): void {
   writeFileSync(agentModelsPath(), JSON.stringify(file, null, 2) + "\n");
 }
 
-async function fetchModels(engine: EngineSpec, baseUrl: string, ctx: number, reasoning: boolean): Promise<any[]> {
-  // llamafile answers both `/models` and `/v1/models`; cortiq only serves the versioned route.
-  let response = await fetch(`${baseUrl}/v1/models`);
-  if (response.status === 404) response = await fetch(`${baseUrl}/models`);
-  if (!response.ok) throw new Error(`${engine.label} server returned HTTP ${response.status}`);
-  const payload: any = await response.json();
-  const entries: any[] = payload?.data ?? payload?.models ?? [];
-  return entries
-    .map((entry) => {
-      const id = entry?.id ?? entry?.name ?? entry?.model;
-      if (typeof id !== "string" || id.length === 0) return null;
-      return {
-        id,
-        name: id,
-        api: "openai-completions",
-        provider: engine.providerId,
-        baseUrl: `${baseUrl}/v1`,
-        reasoning,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: ctx,
-        maxTokens: ctx,
-        // cortiq takes `enable_thinking` and ignores reasoning_effort, so the host's thinking
-        // level drives the chat-template flag: off means no `<think>`, every other level means
-        // think. Without this the model always thought, whatever level the user picked.
-        ...(engine.id === "cortiq"
-          ? {
-              compat: {
-                thinkingFormat: "chat-template",
-                chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" } },
-                supportsReasoningEffort: false,
-              },
-            }
-          : {}),
-      };
-    })
-    .filter(Boolean);
+/** One host-visible model entry: the id is the file slug, so two quants of the
+ * same family (lfm3-1.7b-q4tp, lfm3-1.7b-q8_2f) are distinct models for the
+ * host instead of colliding on the engine's generic served id. Both engines
+ * accept any model field on the wire (single-model servers). */
+function modelEntry(engine: EngineSpec, baseUrl: string, ctx: number, model: ManagedModel, reasoning: boolean) {
+  const slug = modelSlug(model);
+  return {
+    id: slug,
+    name: slug,
+    api: "openai-completions",
+    provider: engine.providerId,
+    baseUrl: `${baseUrl}/v1`,
+    reasoning,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: ctx,
+    maxTokens: ctx,
+    // cortiq takes `enable_thinking` and ignores reasoning_effort, so the host's thinking
+    // level drives the chat-template flag: off means no `<think>`, every other level means
+    // think. Without this the model always thought, whatever level the user picked.
+    ...(engine.id === "cortiq"
+      ? {
+          compat: {
+            thinkingFormat: "chat-template",
+            chatTemplateKwargs: { enable_thinking: { $var: "thinking.enabled" } },
+            supportsReasoningEffort: false,
+          },
+        }
+      : {}),
+  };
+}
+
+/** All discovered models of the engine, the running (or preferred) one first. */
+function modelsForEngine(engineId: EngineId, baseUrl: string, runningId?: string): any[] {
+  const engine = ENGINES[engineId];
+  const { ctxSize } = settings(engineId);
+  const discovered = discoverModels(engineId);
+  const preferred = runningId ?? settings(engineId).modelId;
+  const ordered = [
+    ...discovered.filter((m) => m.id === preferred),
+    ...discovered.filter((m) => m.id !== preferred),
+  ];
+  return ordered.map((m) => modelEntry(engine, baseUrl, ctxSize, m, true));
 }
 
 function providerConfig(engine: EngineSpec, baseUrl: string, models: any[]) {
@@ -831,16 +842,15 @@ function providerConfig(engine: EngineSpec, baseUrl: string, models: any[]) {
     apiKey: "local",
     baseUrl: `${baseUrl}/v1`,
     models,
-    refreshModels: async () => fetchModels(engine, baseUrl, settings(engine.id).ctxSize, true),
+    refreshModels: async () => modelsForEngine(engine.id, baseUrl, active[engine.id]?.modelId ?? undefined),
   };
 }
 
 async function registerRunning(model: ManagedModel, baseUrl: string): Promise<string> {
   const engine = ENGINES[model.engine];
-  const { ctxSize } = settings(model.engine);
   // Both engines expose thinking controls to the host: llamafile through llama.cpp's own
-  // reasoning fields, cortiq through the chat-template flag wired in fetchModels.
-  const models = await fetchModels(engine, baseUrl, ctxSize, true);
+  // reasoning fields, cortiq through the chat-template flag wired in modelEntry.
+  const models = modelsForEngine(model.engine, baseUrl, model.id);
   writeManagedProvider(engine, models);
   api?.registerProvider(engine.providerId, providerConfig(engine, baseUrl, models));
   return `${model.id} ready at ${baseUrl}`;
@@ -870,7 +880,7 @@ async function stopOtherEngines(engineId: EngineId): Promise<void> {
 }
 
 function usageFor(engine: EngineSpec): string {
-  const head = `usage: /${engine.command} [list|status|start|stop|ctx <n>|port <n>|logs [n]${engine.id === "cortiq" ? "|gpu <default|cpu|cuda|wgpu>" : ""}]\n  or /set-<model>  (one command per discovered model: switching never needs a name)\n  note: starting this engine stops the other one`;
+  const head = `usage: /${engine.command} [list|status|set <model>|start|stop|ctx <n>|port <n>|logs [n]${engine.id === "cortiq" ? "|gpu <default|cpu|cuda|wgpu>" : ""}]\n  set <model> starts and uses a model (TAB completes the models)\n  note: starting this engine stops the other one`;
   const lines = [
     `  list          discovered ${engine.id} models`,
     "  status        servers: running, loading or stopped",
@@ -888,6 +898,26 @@ function usageFor(engine: EngineSpec): string {
 }
 
 /** Build the command handler for one engine; both commands share every step. */
+/** Subcommand + model-slug completion for /embedded-*: TAB after `set`/`use`/`start`
+ * lists the discovered models. The returned value replaces the whole args prefix,
+ * matching how the host applies argument completions. */
+function argumentCompletions(engineId: EngineId, prefix: string) {
+  const typed = prefix.toLowerCase();
+  const space = typed.indexOf(" ");
+  const subs = ["list", "status", "set", "start", "stop", "ctx", "port", ...(engineId === "cortiq" ? ["gpu"] : []), "logs"];
+  if (space === -1) {
+    return subs.filter((sub) => sub.startsWith(typed.trim())).map((sub) => ({ value: sub, label: sub }));
+  }
+  const sub = typed.slice(0, space);
+  if (!["set", "use", "start"].includes(sub)) return null;
+  const partial = typed.slice(space + 1);
+  const items = discoverModels(engineId)
+    .map((model) => modelSlug(model))
+    .filter((slug) => slug.startsWith(partial))
+    .map((slug) => ({ value: `${sub} ${slug}`, label: slug }));
+  return items.length > 0 ? items : null;
+}
+
 function commandHandler(engineId: EngineId) {
   const engine = ENGINES[engineId];
   return async (rawArgs: string, ctx: any) => {
@@ -965,15 +995,15 @@ function commandHandler(engineId: EngineId) {
         );
         return;
       }
-      if (sub === "use") {
+      if (sub === "set" || sub === "use") {
         const wanted = rest[0];
         if (!wanted) {
-          fail(`usage: /${engine.command} use <name>  (or just /set-<model>)`);
+          fail(`usage: /${engine.command} ${sub} <model>  (TAB completes the models; see /${engine.command} list)`);
           return;
         }
         const model = models.find((candidate) => candidate.id === wanted);
         if (!model) {
-          fail(`no ${engineId} model named ${wanted}`);
+          fail(`no ${engineId} model named ${wanted}  (see /${engine.command} list)`);
           return;
         }
         say(`switching to ${model.id}...`);
@@ -1087,44 +1117,24 @@ export default function piEmbeddedAiExtension(pi: ExtensionAPI) {
   api = pi;
   packageDir = dirname(new URL(import.meta.url).pathname);
   pi.registerCommand("embedded-llama", {
-    description: "Manage local llamafile models: list, start, stop, ctx, port, status, logs",
+    description: "Manage local llamafile models: set <model> switches, list, status, stop, ctx, port, logs",
     handler: commandHandler("llamafile"),
+    getArgumentCompletions: (prefix: string) => argumentCompletions("llamafile", prefix),
   });
   pi.registerCommand("embedded-cortiq", {
-    description: "Manage local cortiq (.cmf) models: list, start, stop, ctx, port, gpu, status, logs",
+    description: "Manage local cortiq (.cmf) models: set <model> switches, list, status, stop, ctx, port, gpu, logs",
     handler: commandHandler("cortiq"),
+    getArgumentCompletions: (prefix: string) => argumentCompletions("cortiq", prefix),
   });
 
-  // One `set-<model>` command per discovered model, so switching never needs a
-  // typed name. The slug is the model file stem (lowercase); a cross-engine
-  // duplicate gets the engine appended.
-  const usedSlugs = new Set<string>();
+  // Register every discovered model synchronously so the first model resolution
+  // already sees them (the running server is ensured in the background); the
+  // preferred model sorts first.
   for (const engineId of ENGINE_IDS) {
-    for (const model of discoverModels(engineId)) {
-      let slug = modelSlug(model);
-      if (usedSlugs.has(slug)) slug = `${slug}-${engineId}`;
-      if (usedSlugs.has(slug)) continue;
-      usedSlugs.add(slug);
-      const engine = ENGINES[engineId];
-      pi.registerCommand(`set-${slug}`, {
-        description: `Start and use ${model.id} (${engine.label}); stops the other engine`,
-        handler: async (_rawArgs: string, ctx: any) => {
-          const say = (text: string) => ctx?.ui?.notify?.(text, "info");
-          const fail = (text: string) => ctx?.ui?.notify?.(text, "error");
-          const fresh = discoverModels(engineId).find((candidate) => candidate.path === model.path);
-          if (!fresh) {
-            fail(`model file gone: ${model.path}`);
-            return;
-          }
-          say(`switching to ${fresh.id}...`);
-          try {
-            say(await switchTo(fresh));
-          } catch (err) {
-            fail(String(err));
-          }
-        },
-      });
-    }
+    const engine = ENGINES[engineId];
+    const baseUrl = `http://127.0.0.1:${settings(engineId).port}`;
+    const models = modelsForEngine(engineId, baseUrl);
+    if (models.length) api?.registerProvider(engine.providerId, providerConfig(engine, baseUrl, models));
   }
 
   // Auto-start the preferred (or first discovered) model and register it as the local provider.

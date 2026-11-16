@@ -70,6 +70,7 @@ when this happens).
 ```
 /embedded-cortiq list      discovered .cmf models ([preferred], [active], gpu mode)
 /embedded-cortiq status    servers: running, loading or stopped
+/embedded-cortiq set <m>   start and use a model (TAB completes: lfm3-1.7b-q4tp, lfm3-1.7b-q8_2f, ...)
 /embedded-cortiq start     serve the preferred or first discovered model
 /embedded-cortiq stop      terminate the managed server
 /embedded-cortiq ctx <n>   set context size (min 1024, passed as CMF_MAX_SEQ) and restart
@@ -78,8 +79,10 @@ when this happens).
 /embedded-cortiq logs [n]  last n lines of the server log (default 30)
 ```
 
-`use <name>` and `start <name>` still accept an explicit model name for
-scripting, but the `/set-*` commands are the intended interface.
+`use <model>` still works as an alias of `set <model>`. Model ids are the file
+stem slug (e.g. `lfm3-1.7b-q4tp`), so `/scoped-models` shows every quant as a
+distinct model; requests carry that id and both engines accept any model field
+on the wire (single-model servers).
 
 `gpu cpu` is passed to the engine as `CMF_GPU=0`: the engine reads only `0` (or `off`)
 as CPU and treats any other value as "use the wgpu GPU". `cuda` needs a binary built
